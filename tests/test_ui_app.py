@@ -59,3 +59,23 @@ def test_self_signed_detection(monkeypatch):
     monkeypatch.setattr(ui_app.ssl._ssl, "_test_decode_cert", fake_decode, raising=False)  # type: ignore[attr-defined]
 
     assert ui_app._is_self_signed("dummy") is True
+
+
+def test_training_endpoints(monkeypatch):
+    app = create_app(api_key="secret", checkpoint_dir=None)
+    client = app.test_client()
+    monkeypatch.setattr("dragonscales.ui_app.build_dragon", lambda: None)
+
+    start = client.post("/train/start", headers={"X-API-Key": "secret"})
+    assert start.status_code == 200
+    assert start.get_json()["status"] in {"started", "already_running"}
+
+    status = client.get("/train/status", headers={"X-API-Key": "secret"})
+    assert status.status_code == 200
+    body = status.get_json()
+    assert "running" in body
+    assert "loss_history" in body
+
+    chunk = client.get("/train/next-chunk", headers={"X-API-Key": "secret"})
+    assert chunk.status_code == 200
+    assert "chunk" in chunk.get_json()

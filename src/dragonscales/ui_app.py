@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import ssl
 import warnings
-from typing import Any
+import threading
+import random
+import time
+from typing import Any, Generator
 
 from flask import Flask, Response, jsonify, request
 
@@ -30,6 +33,61 @@ def require_api_key(app: Flask, key: str) -> None:
 def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
     app = Flask(__name__)
     require_api_key(app, api_key)
+
+    training_state = {
+        "running": False,
+        "step": 0,
+        "loss_history": [],
+    }
+    training_lock = threading.Lock()
+
+    def _sample_text_iter() -> Generator[str, None, None]:
+        sample = (
+            "In the ancient archives of the DragonScales project, engineers etched notes about routing models. "
+            "Each free LLM expert contributed insights, and the router learned to balance them.\n"
+        ) * 50
+        for paragraph in sample.split("\n"):
+            yield paragraph
+
+    def _chunk_generator(chunk_size: int = 512, overlap: int = 32) -> Generator[str, None, None]:
+        buf = ""
+        for piece in _sample_text_iter():
+            if not isinstance(piece, str):
+                continue
+            piece = " ".join(piece.split())
+            buf += piece + "\n"
+            while len(buf) >= chunk_size:
+                yield buf[:chunk_size]
+                buf = buf[chunk_size - overlap :] if overlap else buf[chunk_size :]
+        if buf:
+            yield buf
+
+    chunk_iter = _chunk_generator()
+
+    def _next_chunk() -> str:
+        nonlocal chunk_iter
+        try:
+            return next(chunk_iter)
+        except StopIteration:
+            chunk_iter = _chunk_generator()
+            return next(chunk_iter)
+
+    def _simulate_training():
+        nonlocal training_state
+        with training_lock:
+            training_state["running"] = True
+            training_state["step"] = 0
+            training_state["loss_history"] = []
+        for step in range(1, 51):
+            chunk = _next_chunk()
+            _ = len(chunk)  # placeholder for real training input
+            loss = max(0.01, 2.0 * (0.95 ** step) + random.uniform(-0.05, 0.05))
+            with training_lock:
+                training_state["step"] = step
+                training_state["loss_history"].append({"step": step, "loss": round(loss, 4)})
+            time.sleep(0.05)
+        with training_lock:
+            training_state["running"] = False
 
     @app.get("/")
     def index() -> Response:
@@ -63,6 +121,10 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
                 <pre id="experts"></pre>
                 <h3>Selection</h3>
                 <pre id="selection"></pre>
+                <h3>Router Training</h3>
+                <button onclick="startTraining()">Start Training</button>
+                <div id="train-status"></div>
+                <canvas id="lossChart" width="600" height="240"></canvas>
             </div>
             <script>
                 function currentHeaders() {
@@ -87,6 +149,42 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
                     }).catch(err => alert(err));
                 }
                 document.getElementById("apiKeyInput").value = localStorage.getItem("dragon_api_key") || "";
+
+                function startTraining() {
+                    fetch("/train/start", {method:"POST", headers: currentHeaders()})
+                      .then(r => r.json())
+                      .then(data => {
+                        document.getElementById("train-status").textContent = JSON.stringify(data, null, 2);
+                      });
+                }
+
+                function pollStatus() {
+                    fetch("/train/status", {headers: currentHeaders()})
+                      .then(r => r.json())
+                      .then(data => {
+                        document.getElementById("train-status").textContent = JSON.stringify(data, null, 2);
+                        drawLoss(data.loss_history || []);
+                      })
+                      .catch(() => {});
+                }
+                setInterval(pollStatus, 1500);
+
+                function drawLoss(history) {
+                    const canvas = document.getElementById("lossChart");
+                    const ctx = canvas.getContext("2d");
+                    ctx.clearRect(0,0,canvas.width,canvas.height);
+                    if (!history.length) return;
+                    const maxStep = Math.max(...history.map(h => h.step));
+                    const maxLoss = Math.max(...history.map(h => h.loss));
+                    ctx.strokeStyle = "#4ade80";
+                    ctx.beginPath();
+                    history.forEach((h, idx) => {
+                        const x = (h.step / maxStep) * canvas.width;
+                        const y = canvas.height - (h.loss / maxLoss) * canvas.height;
+                        if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    });
+                    ctx.stroke();
+                }
             </script>
         </body>
         </html>
@@ -119,6 +217,30 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
         router = _router(models)
         expert = router.select()
         return jsonify({"selected_expert": expert.id})
+
+    @app.post("/train/start")
+    def train_start() -> Response:
+        with training_lock:
+            if training_state["running"]:
+                return jsonify({"status": "already_running"})
+            threading.Thread(target=_simulate_training, daemon=True).start()
+            return jsonify({"status": "started"})
+
+    @app.get("/train/status")
+    def train_status() -> Response:
+        with training_lock:
+            return jsonify(
+                {
+                    "running": training_state["running"],
+                    "step": training_state["step"],
+                    "loss_history": training_state["loss_history"],
+                }
+            )
+
+    @app.get("/train/next-chunk")
+    def train_next_chunk() -> Response:
+        chunk = _next_chunk()
+        return jsonify({"chunk": chunk})
 
     return app
 
