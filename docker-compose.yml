@@ -5,6 +5,11 @@ services:
     depends_on:
       - cache
       - vault
+    volumes:
+      - ./certs:/app/certs:ro
+    command: python -m dragonscales.ui_app
+    ports:
+      - "8443:8443"
     environment:
       - REDIS_USERNAME=${REDIS_USERNAME:-default}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-dev-redis-password}

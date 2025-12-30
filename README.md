@@ -47,3 +47,66 @@ Vault UI is available at http://localhost:8200. The `vault-data` volume preserve
 
 ### Quick dev run
 For a one-command run without exporting env vars, the compose file falls back to `REDIS_PASSWORD=dev-redis-password`. Use this only for local testing. To use real credentials from Vault, set `REDIS_PASSWORD`, `VAULT_TOKEN` or `VAULT_ROLE_ID`/`VAULT_SECRET_ID` in your environment or `.env` before `docker compose up`.
+
+## UI
+Run a simple HTTPS UI (self-signed) to browse free experts and see router selections:
+```bash
+export UI_API_KEY=dev-ui-key
+export UI_TLS_CERT=/path/to/your/fullchain.pem   # e.g., from Let's Encrypt / certbot
+export UI_TLS_KEY=/path/to/your/privkey.pem
+python -m dragonscales.ui_app
+# opens on https://localhost:8443
+```
+Calls are protected via `X-API-Key` or `Authorization: Bearer`. Set `ROUTER_CHECKPOINT_DIR` to persist router state, and use real certs in production by replacing the `ssl_context` argument. Compose still serves only the API; no Node.js middleware is used.
+
+### Seed Vault with dev secrets (example script)
+For local development, you can seed Vault (running in the `dragonscales-vault` container) with sample values and generate a self-signed cert. Save this as `scripts/dev_seed_vault.sh`, fill in your unseal key and root token, then run it from the repo root:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- configure with your dev values ---
+VAULT_ADDR=http://localhost:8200
+VAULT_CONTAINER=dragonscales-vault
+UNSEAL_KEY="<paste-your-unseal-key-here>"
+ROOT_TOKEN="<paste-your-root-token-here>"
+
+# Dev secrets to store
+OPENROUTER_API_KEY="sk-or-dev-123"
+REDIS_PASSWORD="dev-redis-password"
+UI_API_KEY="dev-ui-key"
+UI_TLS_CERT_PATH="/app/certs/ui.crt"
+UI_TLS_KEY_PATH="/app/certs/ui.key"
+
+# --- generate self-signed cert (for dev only) ---
+mkdir -p certs
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout certs/ui.key \
+  -out certs/ui.crt \
+  -days 365 \
+  -subj "/CN=localhost"
+
+# --- ensure Vault is unsealed ---
+docker exec -it "$VAULT_CONTAINER" vault status >/dev/null || { echo "Vault container not running"; exit 1; }
+docker exec -it "$VAULT_CONTAINER" vault operator unseal "$UNSEAL_KEY"
+
+# --- write secrets into KV v2 at secret/dragonscales ---
+docker exec -e VAULT_ADDR=http://localhost:8200 -e VAULT_TOKEN="$ROOT_TOKEN" "$VAULT_CONTAINER" \
+  vault kv put secret/dragonscales \
+    OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+    REDIS_PASSWORD="$REDIS_PASSWORD" \
+    REDIS_USERNAME=default \
+    UI_API_KEY="$UI_API_KEY" \
+    UI_TLS_CERT="$UI_TLS_CERT_PATH" \
+    UI_TLS_KEY="$UI_TLS_KEY_PATH"
+
+echo "Done. Ensure ./certs is mounted into the app container:"
+echo "  volumes:"
+echo "    - ./certs:/app/certs:ro"
+```
+Run it with:
+```bash
+chmod +x scripts/dev_seed_vault.sh
+./scripts/dev_seed_vault.sh
+```
+Then start the stack with `docker compose up -d` and visit `https://localhost:8443` (enter the UI API key in the page). For production, replace the self-signed cert with a trusted one and use proper tokens/roles.

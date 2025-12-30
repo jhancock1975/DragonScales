@@ -11,6 +11,9 @@ from typing import Callable, Mapping, MutableMapping
 class Settings:
     openrouter_api_key: str
     cache_url: str | None = None
+    ui_api_key: str | None = None
+    ui_tls_cert: str | None = None
+    ui_tls_key: str | None = None
 
 
 def build_cache_url(source: Mapping[str, str]) -> str | None:
@@ -83,4 +86,10 @@ def load_settings(
         raise ValueError("OPENROUTER_API_KEY is not set in environment or Vault")
 
     cache_url_value = merged.get("CACHE_URL") or build_cache_url(merged)
-    return Settings(openrouter_api_key=openrouter_api_key, cache_url=cache_url_value)
+    return Settings(
+        openrouter_api_key=openrouter_api_key,
+        cache_url=cache_url_value,
+        ui_api_key=merged.get("UI_API_KEY") or merged.get("API_KEY"),
+        ui_tls_cert=merged.get("UI_TLS_CERT"),
+        ui_tls_key=merged.get("UI_TLS_KEY"),
+    )
