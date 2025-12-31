@@ -24,11 +24,14 @@ def test_ui_allows_with_api_key(monkeypatch):
             self.description = "desc"
 
     def fake_build_dragon():
-        class D:
+        class DummyDragon:
+            def __init__(self):
+                self.client = None
+
             def refresh_models(self, force=False):
                 return [DummyModel("m1")]
 
-        return D()
+        return DummyDragon()
 
     monkeypatch.setattr("dragonscales.ui_app.build_dragon", fake_build_dragon)
 
@@ -64,7 +67,13 @@ def test_self_signed_detection(monkeypatch):
 def test_training_endpoints(monkeypatch):
     app = create_app(api_key="secret", checkpoint_dir=None)
     client = app.test_client()
-    monkeypatch.setattr("dragonscales.ui_app.build_dragon", lambda: None)
+    dummy_model = type("M", (), {"id": "m1"})
+
+    class DummyDragon:
+        def refresh_models(self, force=False):
+            return [dummy_model]
+
+    monkeypatch.setattr("dragonscales.ui_app.build_dragon", lambda: DummyDragon())
 
     start = client.post("/train/start", headers={"X-API-Key": "secret"})
     assert start.status_code == 200
@@ -79,3 +88,62 @@ def test_training_endpoints(monkeypatch):
     chunk = client.get("/train/next-chunk", headers={"X-API-Key": "secret"})
     assert chunk.status_code == 200
     assert "chunk" in chunk.get_json()
+
+
+def test_chat_endpoints(monkeypatch):
+    app = create_app(api_key="secret", checkpoint_dir=None)
+    client = app.test_client()
+
+    dummy_model = type("M", (), {"id": "m-chat"})
+
+    class DummyDragon:
+        def refresh_models(self, force=False):
+            return [dummy_model]
+
+    class DummyMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class DummyChoice:
+        def __init__(self, content):
+            self.message = DummyMessage(content)
+
+    class DummyChat:
+        def __init__(self):
+            self.completions = self
+
+        def create(self, model, messages, max_tokens, timeout=None):
+            # Return both string and structured content to exercise _extract_content
+            msg = "hi" if messages[0]["content"] == "hello" else [
+                type("P", (), {"text": "joined"}),
+                " text"
+            ]
+            return type("R", (), {"choices": [DummyChoice(msg)], "model": model})
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = DummyChat()
+
+    class DummyDragon:
+        def __init__(self):
+            self.client = DummyClient()
+
+        def refresh_models(self, force=False):
+            return [dummy_model]
+
+    monkeypatch.setattr("dragonscales.ui_app.build_dragon", lambda: DummyDragon())
+
+    missing = client.post("/chat/send", headers={"X-API-Key": "secret"}, json={})
+    assert missing.status_code == 400
+
+    resp = client.post("/chat/send", headers={"X-API-Key": "secret"}, json={"message": "hello"})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_expert"] == "m-chat"
+    assert data["response"] == "hi"
+
+    # second call exercises list-part content aggregation
+    resp2 = client.post("/chat/send", headers={"X-API-Key": "secret"}, json={"message": "other"})
+    assert resp2.status_code == 200
+    data2 = resp2.get_json()
+    assert data2["response"] == "joined text"

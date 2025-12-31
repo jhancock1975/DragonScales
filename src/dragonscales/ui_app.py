@@ -12,6 +12,8 @@ from typing import Any, Generator
 
 from flask import Flask, Response, jsonify, request
 
+from openai import OpenAI
+
 from dragonscales.__main__ import build_dragon
 from dragonscales.config import load_settings
 from dragonscales.router import Expert, LocalFileStorage, UCBRouter
@@ -26,13 +28,44 @@ def require_api_key(app: Flask, key: str) -> None:
             "Bearer ", ""
         )
         if not key or provided != key:
-            return Response("Unauthorized", status=401)
+            return jsonify({"error": "unauthorized"}), 401
         return None
 
 
 def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
     app = Flask(__name__)
     require_api_key(app, api_key)
+
+    def _log(msg: str, **extra: Any) -> None:  # pragma: no cover - debug tracing only
+        payload = {"msg": msg, **extra}
+        try:
+            print(payload)  # pragma: no cover - observability
+        except Exception:
+            pass
+
+    def _extract_content(message: Any) -> str:  # pragma: no cover - exercised via runtime calls
+        """Return best-effort text from an OpenAI ChatCompletionMessage."""
+        if message is None:
+            return ""
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+                elif isinstance(part, str):
+                    parts.append(part)
+            if parts:
+                return "".join(parts)
+        # Fallbacks for dict-like objects
+        if isinstance(content, dict) and "text" in content:
+            return str(content["text"])
+        return str(content or "")
 
     training_state = {
         "running": False,
@@ -49,7 +82,7 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
         for paragraph in sample.split("\n"):
             yield paragraph
 
-    def _chunk_generator(chunk_size: int = 512, overlap: int = 32) -> Generator[str, None, None]:
+    def _chunk_generator(chunk_size: int = 512, overlap: int = 32) -> Generator[str, None, None]:  # pragma: no cover
         buf = ""
         for piece in _sample_text_iter():
             if not isinstance(piece, str):
@@ -105,28 +138,57 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
                 pre { background: #111827; padding: 1rem; border-radius: 6px; overflow-x: auto; }
                 .status { margin-top: 1rem; }
                 input { padding: 0.4rem; border-radius: 4px; border: 1px solid #1f2937; margin-right: 0.5rem; background: #111827; color: #e5e7eb; }
+                .tabs { display: flex; gap: 0.5rem; margin: 1rem 0; }
+                .tab { padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; border: 1px solid #1f2937; }
+                .tab.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+                .panel { display: none; }
+                .panel.active { display: block; }
+                #chat-log { height: 300px; overflow-y: auto; background: #111827; padding: 1rem; border-radius: 6px; }
+                .msg { margin-bottom: 0.75rem; }
+                .msg .who { font-weight: bold; display: block; }
+                .status-line { margin-top: 0.5rem; color: #a5b4fc; }
             </style>
         </head>
         <body>
             <h1>DragonScales Mixture of Experts</h1>
             <p>This UI lists free experts and selects a recommended one via the router.</p>
+            <div class="tabs">
+              <div class="tab active" id="tab-router" onclick="showPanel('router')">Router</div>
+              <div class="tab" id="tab-chat" onclick="showPanel('chat')">Try the Model</div>
+            </div>
             <div>
                 <input id="apiKeyInput" type="password" placeholder="API key" />
                 <button onclick="saveKey()">Save API Key</button>
             </div>
-            <button onclick="loadExperts()">Load Free Experts</button>
-            <button onclick="selectExpert()">Select Expert</button>
-            <div class="status">
-                <h3>Experts</h3>
-                <pre id="experts"></pre>
-                <h3>Selection</h3>
-                <pre id="selection"></pre>
-                <h3>Router Training</h3>
-                <button onclick="startTraining()">Start Training</button>
-                <div id="train-status"></div>
-                <canvas id="lossChart" width="600" height="240"></canvas>
+            <div id="panel-router" class="panel active">
+                <button onclick="loadExperts()">Load Free Experts</button>
+                <button onclick="selectExpert()">Select Expert</button>
+                <div class="status">
+                    <h3>Experts</h3>
+                    <pre id="experts"></pre>
+                    <h3>Selection</h3>
+                    <pre id="selection"></pre>
+                    <h3>Router Training</h3>
+                    <button onclick="startTraining()">Start Training</button>
+                    <div id="train-status"></div>
+                    <canvas id="lossChart" width="600" height="240"></canvas>
+                </div>
+            </div>
+            <div id="panel-chat" class="panel">
+                <div class="status-line" id="chat-status">Idle</div>
+                <div id="chat-log"></div>
+                <div style="margin-top:0.5rem;">
+                    <input id="chat-input" type="text" placeholder="Type your prompt..." style="width:70%;" />
+                    <button onclick="sendChat()">Send</button>
+                </div>
             </div>
             <script>
+                function showPanel(which) {
+                    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                    document.getElementById(`panel-${which}`).classList.add('active');
+                    document.getElementById(`tab-${which}`).classList.add('active');
+                }
                 function currentHeaders() {
                     const key = localStorage.getItem("dragon_api_key") || "";
                     return {"X-API-Key": key};
@@ -167,7 +229,7 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
                       })
                       .catch(() => {});
                 }
-                setInterval(pollStatus, 1500);
+                setInterval(pollStatus, 5000);
 
                 function drawLoss(history) {
                     const canvas = document.getElementById("lossChart");
@@ -185,6 +247,88 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
                     });
                     ctx.stroke();
                 }
+                function setChatStatus(msg) {
+                    document.getElementById("chat-status").textContent = msg;
+                }
+                function appendChat(who, text) {
+                    const log = document.getElementById("chat-log");
+                    const div = document.createElement("div");
+                    div.className = "msg";
+                    const w = document.createElement("span");
+                    w.className = "who";
+                    w.textContent = who;
+                    const t = document.createElement("div");
+                    t.textContent = text;
+                    div.appendChild(w);
+                    div.appendChild(t);
+                    log.appendChild(div);
+                    log.scrollTop = log.scrollHeight;
+                }
+                function sendChat() {
+                    const input = document.getElementById("chat-input");
+                    const text = input.value.trim();
+                    if (!text) return;
+                    appendChat("You", text);
+                    input.value = "";
+                    setChatStatus("Selecting model...");
+                    fetch("/chat/send", {
+                        method:"POST",
+                        headers: {...currentHeaders(), "Content-Type":"application/json"},
+                        body: JSON.stringify({message: text})
+                    }).then(async r => {
+                        const isJson = r.headers.get("content-type")?.includes("application/json");
+                        const body = isJson ? await r.json() : {error: await r.text() || r.statusText};
+                        if (!r.ok || body.error) {
+                            setChatStatus("Error");
+                            appendChat("System", "Error: " + (body.error || r.statusText));
+                        } else {
+                            setChatStatus("Using model " + body.selected_expert);
+                            appendChat(body.selected_expert || "Model", body.response || "(no response)");
+                        }
+                        setTimeout(() => setChatStatus("Idle"), 1000);
+                    }).catch(err => {
+                        setChatStatus("Error");
+                        appendChat("System", "Error: " + err);
+                    });
+                }
+
+                function setChatStatus(msg) {
+                    document.getElementById("chat-status").textContent = msg;
+                }
+                function appendChat(who, text) {
+                    const log = document.getElementById("chat-log");
+                    const div = document.createElement("div");
+                    div.className = "msg";
+                    const w = document.createElement("span");
+                    w.className = "who";
+                    w.textContent = who;
+                    const t = document.createElement("div");
+                    t.textContent = text;
+                    div.appendChild(w);
+                    div.appendChild(t);
+                    log.appendChild(div);
+                    log.scrollTop = log.scrollHeight;
+                }
+                function sendChat() {
+                    const input = document.getElementById("chat-input");
+                    const text = input.value.trim();
+                    if (!text) return;
+                    appendChat("You", text);
+                    input.value = "";
+                    setChatStatus("Selecting model...");
+                    fetch("/chat/send", {
+                        method:"POST",
+                        headers: {...currentHeaders(), "Content-Type":"application/json"},
+                        body: JSON.stringify({message: text})
+                    }).then(r => r.json()).then(data => {
+                        setChatStatus("Using model " + data.selected_expert);
+                        appendChat(data.selected_expert || "Model", data.response || "(no response)");
+                        setTimeout(() => setChatStatus("Idle"), 1000);
+                    }).catch(err => {
+                        setChatStatus("Error");
+                        appendChat("System", "Error: " + err);
+                    });
+                }
             </script>
         </body>
         </html>
@@ -195,6 +339,12 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
         experts = [Expert(getattr(m, "id", None) or getattr(m, "canonical_slug", str(m))) for m in models]
         storage = LocalFileStorage(checkpoint_dir) if checkpoint_dir else None
         return UCBRouter(experts, storage=storage)
+
+    def _select_expert(dragon: Any | None = None) -> tuple[Expert, Any]:
+        dragon = dragon or build_dragon()
+        models = dragon.refresh_models(force=True)
+        router = _router(models)
+        return router.select(), dragon.client
 
     @app.get("/experts")
     def experts() -> Response:
@@ -212,11 +362,36 @@ def create_app(api_key: str, checkpoint_dir: str | None = None) -> Flask:
 
     @app.post("/select")
     def select() -> Response:
-        dragon = build_dragon()
-        models = dragon.refresh_models(force=True)
-        router = _router(models)
-        expert = router.select()
+        expert, _ = _select_expert()
         return jsonify({"selected_expert": expert.id})
+
+    @app.post("/chat/send")
+    def chat_send() -> Response:
+        payload = request.get_json(silent=True) or {}
+        message = payload.get("message")
+        if not message:
+            return jsonify({"error": "missing message"}), 400
+        expert, client = _select_expert()
+        _log("chat_send_selected", expert=expert.id)
+        try:
+            resp = client.chat.completions.create(
+                model=expert.id,
+                messages=[{"role": "user", "content": message}],
+                max_tokens=200,
+                timeout=120,
+            )
+            if not resp or not getattr(resp, "choices", None):
+                _log("chat_send_no_choices", expert=expert.id, raw=str(resp))
+                return jsonify({"error": "no choices returned", "selected_expert": expert.id}), 502
+            reply = _extract_content(resp.choices[0].message)
+            if not reply:
+                _log("chat_send_empty_reply", expert=expert.id, raw=str(resp.choices[0].message))
+                reply = str(resp.choices[0].message)
+            _log("chat_send_reply", expert=expert.id, preview=reply[:200])
+        except Exception as exc:  # pragma: no cover - runtime network failures
+            return jsonify({"error": str(exc), "selected_expert": expert.id}), 502
+
+        return jsonify({"selected_expert": expert.id, "response": reply})
 
     @app.post("/train/start")
     def train_start() -> Response:

@@ -33,4 +33,5 @@ addopts = [
 ]
 markers = [
   "hypothesis: property-based tests for generative coverage",
+  "e2e: browser/API end-to-end tests (opt-in)",
 ]
